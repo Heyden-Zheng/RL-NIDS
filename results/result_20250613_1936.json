@@ -1,0 +1,11 @@
+{
+  "dataset": "NSL-KDD",
+  "timestamp": "20250613_1936",
+  "batch_size": 256,
+  "metrics": {
+    "Accuracy": 0.8715997845408026,
+    "Precision": 0.7661022409389739,
+    "Recall": 0.8715997845408026,
+    "F1 Score": 0.8142011566282241
+  }
+}
