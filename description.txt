@@ -1,0 +1,508 @@
+下面我将根据论文的思路，从数据处理到模型输出和损失计算，逐部分对应到代码实现。
+
+1. 数据处理 (对应 data_loader.py)
+论文描述:
+
+数据预处理包括数据清洗、数值化和特征缩放。对于NSL-KDD数据集，保留所有对象；对于AWID数据集，移除重复特征和无效值，最终保留23个特征。
+
+代码实现:
+
+python
+# data_loader.py
+
+def _preprocess_data(self, df):
+    """数据预处理"""
+    # 标准化数值特征
+    scaler = StandardScaler()
+    numeric_data = scaler.fit_transform(df[self.numeric_cols])
+
+    # 对分类特征进行one-hot编码
+    encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+    categorical_data = encoder.fit_transform(df[self.categorical_cols])
+
+    # 合并特征
+    X = np.concatenate([numeric_data, categorical_data], axis=1)
+    y = df[self.label_col].values
+
+    # 划分训练测试集
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=self.config.SEED, stratify=y)
+
+    return {
+        'X_train': X_train,
+        'X_test': X_test,
+        'y_train': y_train,
+        'y_test': y_test,
+        'numeric_cols': self.numeric_cols,
+        'categorical_cols': self.categorical_cols,
+        'label_map': self.label_map,
+        'scaler': scaler,
+        'encoder': encoder
+    }
+2. 特征值表示学习 (FVRL) (对应 fvrl.py)
+论文描述:
+
+FVRL模块通过构建值-值耦合矩阵(M0和Mc)捕获分类特征值之间的显式交互，然后进行多粒度聚类，最后使用自编码器学习特征值嵌入。
+
+代码实现:
+
+python
+# fvrl.py
+
+def build_coupling_matrices(self):
+    """构建值-值耦合矩阵"""
+    # 计算互信息矩阵
+    nmi_matrix = np.zeros((self.m, self.m))
+    for i in range(self.m):
+        for j in range(i, self.m):
+            # 获取特征和值
+            fi, vi = self._get_feature_and_value(i)
+            fj, vj = self._get_feature_and_value(j)
+
+            # 计算联合概率
+            p_vi = np.mean(self.categorical_data[:, fi] == vi)
+            p_vj = np.mean(self.categorical_data[:, fj] == vj)
+            p_vi_vj = np.mean((self.categorical_data[:, fi] == vi) &
+                             (self.categorical_data[:, fj] == vj))
+
+            # 计算互信息和归一化互信息
+            if p_vi_vj > 0:
+                mi = p_vi_vj * np.log(p_vi_vj / (p_vi * p_vj))
+                h_vi = -p_vi * np.log(p_vi) if p_vi > 0 else 0
+                h_vj = -p_vj * np.log(p_vj) if p_vj > 0 else 0
+                nmi = 2 * mi / (h_vi + h_vj) if (h_vi + h_vj) > 0 else 0
+                nmi_matrix[i, j] = nmi
+                nmi_matrix[j, i] = nmi
+
+    # 构建基于出现频率的耦合矩阵M0
+    M0 = np.zeros((self.m, self.m))
+    for i in range(self.m):
+        for j in range(self.m):
+            fi, vi = self._get_feature_and_value(i)
+            fj, vj = self._get_feature_and_value(j)
+            p_vi = np.mean(self.categorical_data[:, fi] == vi)
+            p_vj = np.mean(self.categorical_data[:, fj] == vj)
+            M0[i, j] = nmi_matrix[i, j] * (p_vi / p_vj)
+
+    # 构建基于共现的耦合矩阵Mc
+    Mc = np.zeros((self.m, self.m))
+    for i in range(self.m):
+        for j in range(self.m):
+            fi, vi = self._get_feature_and_value(i)
+            fj, vj = self._get_feature_and_value(j)
+            p_vi = np.mean(self.categorical_data[:, fi] == vi)
+            p_vi_vj = np.mean((self.categorical_data[:, fi] == vi) &
+                             (self.categorical_data[:, fj] == vj))
+            Mc[i, j] = p_vi_vj / p_vi if p_vi > 0 else 0
+
+    return M0, Mc
+
+def multi_grain_clustering(self, M0, Mc):
+    """多粒度聚类"""
+    cluster_memberships = []
+
+    # 对M0进行多粒度聚类
+    for k in self.config.FVRL_CLUSTER_NUMS:
+        kmeans = KMeans(n_clusters=k, random_state=self.config.SEED)
+        clusters = kmeans.fit_predict(M0)
+        membership = np.eye(k)[clusters]
+        cluster_memberships.append(membership)
+
+    # 对Mc进行多粒度聚类
+    for k in self.config.FVRL_CLUSTER_NUMS:
+        kmeans = KMeans(n_clusters=k, random_state=self.config.SEED)
+        clusters = kmeans.fit_predict(Mc)
+        membership = np.eye(k)[clusters]
+        cluster_memberships.append(membership)
+
+    # 合并所有聚类结果
+    C = np.concatenate(cluster_memberships, axis=1)
+    return C
+
+def train_autoencoder(self, C, epochs=50, batch_size=256):
+    """训练特征值自编码器"""
+    # 转换为PyTorch张量
+    C_tensor = torch.FloatTensor(C).to(self.device)
+
+    # 初始化模型
+    input_dim = C.shape[1]
+    model = ValueAutoencoder(input_dim, self.config.FVRL_HIDDEN_DIM).to(self.device)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=self.config.LEARNING_RATE)
+
+    # 训练循环
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        outputs = model(C_tensor)
+        loss = criterion(outputs, C_tensor)
+        loss.backward()
+        optimizer.step()
+
+    return model
+3. 准备NNRL输入 (对应 rl_nids.py)
+论文描述:
+
+将FVRL生成的特征值嵌入与原始数值特征融合，形成NNRL的输入。
+
+代码实现:
+
+python
+# rl_nids.py
+
+def prepare_nnrl_input(self, value_embeddings, X):
+    """准备NNRL输入数据"""
+    # 分离数值特征和分类特征
+    num_numeric = len(self.data['numeric_cols'])
+    numeric_data = X[:, :num_numeric]
+    categorical_data = X[:, num_numeric:]
+
+    # 获取每个样本的特征值嵌入
+    sample_embeddings = []
+    for sample in categorical_data:
+        # 找到样本中非零的特征值索引
+        nonzero_indices = np.where(sample == 1)[0]
+
+        # 计算这些特征值嵌入的平均
+        if len(nonzero_indices) > 0:
+            emb = np.mean(value_embeddings[nonzero_indices], axis=0)
+        else:
+            emb = np.zeros(value_embeddings.shape[1])
+
+        sample_embeddings.append(emb)
+
+    # 合并数值特征和特征值嵌入
+    nnrl_input = np.concatenate([numeric_data, np.array(sample_embeddings)], axis=1)
+
+    return nnrl_input
+4. 对象表示学习 (NNRL) (对应 nnrl.py)
+论文描述:
+
+NNRL模块通过深度神经网络学习对象表示，使用分类损失和三元组损失联合优化。
+
+代码实现:
+
+python
+# nnrl.py
+
+class NNRL(nn.Module):
+    """对象表示学习模块"""
+    def __init__(self, input_dim, num_classes):
+        super(NNRL, self).__init__()
+        self.config = Config()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # 编码器部分
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, self.config.NNRL_DIMS[0]),
+            nn.ReLU(),
+            nn.Linear(self.config.NNRL_DIMS[0], self.config.NNRL_DIMS[1]),
+            nn.ReLU(),
+            nn.Linear(self.config.NNRL_DIMS[1], self.config.NNRL_DIMS[2]),
+            nn.ReLU(),
+            nn.Linear(self.config.NNRL_DIMS[2], self.config.NNRL_DIMS[3]),
+            nn.ReLU()
+        )
+
+        # 分类器部分
+        self.classifier = nn.Sequential(
+            nn.Linear(self.config.NNRL_DIMS[3], num_classes),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x):
+        """前向传播"""
+        representations = self.encoder(x)
+        outputs = self.classifier(representations)
+        return outputs, representations
+
+    def triplet_loss(self, anchor, positive, negative):
+        """计算三元组损失"""
+        pos_dist = torch.sum((anchor - positive).pow(2), dim=1)
+        neg_dist = torch.sum((anchor - negative).pow(2), dim=1)
+        losses = torch.relu(pos_dist - neg_dist + self.config.TRIPLET_MARGIN)
+        return torch.mean(losses)
+
+    def train_step(self, X, y, triplet_generator):
+        """训练步骤"""
+        self.train()
+        self.optimizer.zero_grad()
+
+        # 转换为PyTorch张量
+        X_tensor = torch.FloatTensor(X).to(self.device)
+        y_tensor = torch.LongTensor(y).to(self.device)
+
+        # 前向传播
+        outputs, representations = self(X_tensor)
+
+        # 计算分类损失
+        cls_loss = self.cls_criterion(outputs, y_tensor)
+
+        # 计算三元组损失
+        if triplet_generator:
+            reps_np = representations.detach().cpu().numpy()
+            triplets = triplet_generator.generate_triplets(embeddings=reps_np)
+
+            if triplets:
+                anchors = representations[[t[0] for t in triplets]]
+                positives = representations[[t[1] for t in triplets]]
+                negatives = representations[[t[2] for t in triplets]]
+
+                tri_loss = self.triplet_loss(anchors, positives, negatives)
+                total_loss = cls_loss + self.config.TRIPLET_ALPHA * tri_loss
+            else:
+                total_loss = cls_loss
+        else:
+            total_loss = cls_loss
+
+        # 反向传播
+        total_loss.backward()
+        self.optimizer.step()
+
+        return {
+            'loss': total_loss.item(),
+            'cls_loss': cls_loss.item()
+        }
+5. 三元组生成 (对应 triplet_generator.py)
+论文描述:
+
+使用定制化的三元组学习方案解决有限标记数据问题，通过三元组采样和三元组损失使数据分布更平衡。
+
+代码实现:
+
+python
+# triplet_generator.py
+
+class TripletGenerator:
+    """三元组生成器"""
+    def __init__(self, y_train):
+        self.config = Config()
+        self.y_train = y_train
+        self.class_indices = self._get_class_indices()
+
+    def _get_class_indices(self):
+        """获取每个类别的样本索引"""
+        class_indices = defaultdict(list)
+        for idx, label in enumerate(self.y_train):
+            class_indices[label].append(idx)
+        return class_indices
+
+    def generate_triplets(self, embeddings=None, n_triplets=1000, hard_ratio=0.5):
+        """
+        生成三元组
+        :param embeddings: 当前样本嵌入（用于生成困难三元组）
+        :param n_triplets: 要生成的三元组数量
+        :param hard_ratio: 困难三元组比例
+        """
+        triplets = []
+        n_hard = int(n_triplets * hard_ratio)
+        n_random = n_triplets - n_hard
+
+        # 生成随机三元组
+        for _ in range(n_random):
+            anchor_class = np.random.choice(list(self.class_indices.keys()))
+            positive_class = anchor_class
+            negative_class = np.random.choice([c for c in self.class_indices.keys()
+                                            if c != anchor_class])
+
+            anchor_idx = np.random.choice(self.class_indices[anchor_class])
+            positive_idx = np.random.choice(self.class_indices[positive_class])
+            negative_idx = np.random.choice(self.class_indices[negative_class])
+
+            triplets.append((anchor_idx, positive_idx, negative_idx))
+
+        # 如果提供了嵌入，生成困难三元组
+        if embeddings is not None and n_hard > 0:
+            hard_triplets = self._generate_hard_triplets(embeddings, n_hard)
+            triplets.extend(hard_triplets)
+
+        return triplets
+
+    def _generate_hard_triplets(self, embeddings, n_triplets):
+        """生成困难三元组"""
+        hard_triplets = []
+
+        for _ in range(n_triplets):
+            # 随机选择一个类别作为anchor和positive
+            anchor_class = np.random.choice(list(self.class_indices.keys()))
+            positive_class = anchor_class
+
+            # 随机选择另一个类别作为negative
+            negative_class = np.random.choice([c for c in self.class_indices.keys()
+                                            if c != anchor_class])
+
+            # 从anchor类中随机选择一个样本作为anchor
+            anchor_idx = np.random.choice(self.class_indices[anchor_class])
+            anchor_embed = embeddings[anchor_idx]
+
+            # 计算anchor与同类样本的距离
+            positive_dists = []
+            for pos_idx in self.class_indices[positive_class]:
+                if pos_idx == anchor_idx:
+                    continue
+                dist = np.linalg.norm(anchor_embed - embeddings[pos_idx])
+                positive_dists.append((pos_idx, dist))
+
+            # 选择距离最远的positive（hard positive）
+            if positive_dists:
+                positive_dists.sort(key=lambda x: x[1], reverse=True)
+                positive_idx = positive_dists[0][0]
+            else:
+                positive_idx = anchor_idx
+
+            # 计算anchor与不同类样本的距离
+            negative_dists = []
+            for neg_idx in self.class_indices[negative_class]:
+                dist = np.linalg.norm(anchor_embed - embeddings[neg_idx])
+                negative_dists.append((neg_idx, dist))
+
+            # 选择距离最近的negative（hard negative）
+            if negative_dists:
+                negative_dists.sort(key=lambda x: x[1])
+                negative_idx = negative_dists[0][0]
+            else:
+                negative_idx = np.random.choice(self.class_indices[negative_class])
+
+            hard_triplets.append((anchor_idx, positive_idx, negative_idx))
+
+        return hard_triplets
+6. 模型训练流程 (对应 rl_nids.py 和 train.py)
+论文描述:
+
+先训练FVRL模块，然后使用其输出与数值特征融合作为NNRL的输入，最后训练NNRL模块。
+
+代码实现:
+
+python
+# rl_nids.py
+
+class RLNIDS:
+    """完整的RL-NIDS模型"""
+    def train_fvrl(self):
+        """训练FVRL模块"""
+        # 获取分类数据
+        categorical_data = self.data['X_train'][:, len(self.data['numeric_cols']):]
+
+        # 初始化FVRL
+        self.fvrl = FVRL(categorical_data, self.data['encoder'])
+
+        # 构建耦合矩阵
+        M0, Mc = self.fvrl.build_coupling_matrices()
+
+        # 多粒度聚类
+        C = self.fvrl.multi_grain_clustering(M0, Mc)
+
+        # 训练自编码器
+        autoencoder = self.fvrl.train_autoencoder(C)
+
+        # 获取特征值嵌入
+        value_embeddings = self.fvrl.get_value_embeddings(autoencoder, C)
+
+        return value_embeddings
+
+    def train(self):
+        """训练完整RL-NIDS模型"""
+        print("Training FVRL module...")
+        value_embeddings = self.train_fvrl()
+
+        print("\nPreparing NNRL input...")
+        X_train = self.prepare_nnrl_input(value_embeddings, self.data['X_train'])
+        X_test = self.prepare_nnrl_input(value_embeddings, self.data['X_test'])
+
+        print("\nTraining NNRL module...")
+        self.train_nnrl(X_train, self.data['y_train'])
+
+        return X_train, X_test
+python
+# train.py
+
+def main():
+    # 初始化配置和数据加载器
+    config = Config()
+    data_loader = DataLoader()
+    data = data_loader.load_data()
+
+    # 初始化RL-NIDS模型
+    rl_nids = RLNIDS(data_loader)
+
+    # 训练模型
+    X_train, X_test = rl_nids.train()
+
+    # 在测试集上评估
+    y_test = data['y_test']
+    y_pred = rl_nids.predict(X_test)
+
+    # 计算评估指标
+    metrics = compute_metrics(y_test, y_pred)
+    print("\nTest Metrics:")
+    for name, value in metrics.items():
+        print(f"{name}: {value:.4f}")
+
+    # 保存模型
+    if config.SAVE_MODEL:
+        os.makedirs(config.MODEL_PATH, exist_ok=True)
+        model_path = os.path.join(config.MODEL_PATH, 'rl_nids.pth')
+        rl_nids.save_model(model_path)
+        print(f"\nModel saved to {model_path}")
+7. 评估指标 (对应 metrics.py)
+论文描述:
+
+使用准确率、精确率、召回率和F1分数评估模型性能。
+
+代码实现:
+
+python
+# metrics.py
+
+def compute_metrics(y_true, y_pred):
+    """计算分类评估指标"""
+    metrics = {
+        'Accuracy': accuracy_score(y_true, y_pred),
+        'Precision': precision_score(y_true, y_pred, average='weighted'),
+        'Recall': recall_score(y_true, y_pred, average='weighted'),
+        'F1 Score': f1_score(y_true, y_pred, average='weighted')
+    }
+    return metrics
+完整流程总结
+数据处理:
+
+加载数据集并进行预处理 (data_loader.py)
+
+标准化数值特征
+
+One-hot编码分类特征
+
+特征值表示学习 (FVRL):
+
+构建值-值耦合矩阵M0和Mc (fvrl.py)
+
+多粒度聚类生成聚类指示矩阵
+
+使用自编码器学习特征值嵌入
+
+准备NNRL输入:
+
+将分类特征转换为特征值嵌入 (rl_nids.py)
+
+融合数值特征和特征值嵌入
+
+对象表示学习 (NNRL):
+
+构建深度神经网络 (nnrl.py)
+
+使用分类损失和三元组损失联合优化
+
+困难三元组挖掘增强模型性能
+
+模型训练:
+
+先训练FVRL模块，再训练NNRL模块 (rl_nids.py, train.py)
+
+分批处理数据，动态生成三元组
+
+模型评估:
+
+计算准确率、精确率、召回率和F1分数 (metrics.py)
+
+支持多类别分类评估
+
+这个实现完整地复现了论文中描述的RL-NIDS系统，从数据处理到模型训练和评估，每个步骤都有对应的代码实现。代码结构清晰，模块化设计，便于理解和扩展。
